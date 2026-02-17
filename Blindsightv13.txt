@@ -1,0 +1,655 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, PillowWriter
+import random
+import math
+import argparse
+import pygame  # For sonification (brightness to sound)
+import torch  # For differentiable retinotopy model
+import time
+import scipy.ndimage as ndimage  # For efficient neighbor averages in filling-in
+
+# ========================== Configuration ==========================
+parser = argparse.ArgumentParser(description="Enhanced Research-Grade Cortical/Retinal Visual Prosthesis Simulator")
+parser.add_argument('--grid_size', type=int, default=32, help='Electrodes per side (default: 32)')
+parser.add_argument('--base_phosphene_sigma', type=float, default=3.0, help='Base sigma in grid units for Gaussian phosphenes (default: 3.0)')
+parser.add_argument('--spacing', type=int, default=24, help='Pixel spacing between phosphene centers (default: 24)')
+parser.add_argument('--max_current', type=float, default=100.0, help='Maximum stimulation current in µA (default: 100.0)')
+parser.add_argument('--threshold_current', type=float, default=10.0, help='Threshold current in µA for phosphene detection (default: 10.0)')
+parser.add_argument('--saturation_current', type=float, default=80.0, help='Current at which cortical activation saturates (default: 80.0)')
+parser.add_argument('--max_sigma_scale', type=float, default=2.0, help='Maximum sigma scale due to current/eccentricity (default: 2.0)')
+parser.add_argument('--ecc_base_size', type=float, default=0.3, help='Base phosphene size in degrees at eccentricity=0 (default: 0.3)')
+parser.add_argument('--ecc_linear_factor', type=float, default=0.15, help='Linear increase of phosphene size with eccentricity (deg/deg) (default: 0.15)')
+parser.add_argument('--implant_type', type=str, choices=['cortical', 'retinal'], default='cortical', help='Implant type: cortical (log warping) or retinal (uniform) (default: cortical)')
+parser.add_argument('--use_webcam', action='store_true', default=True, help='Use webcam (default); --no-webcam for static image')
+parser.add_argument('--image_path', type=str, default='example_image.jpg', help='Path to static image if not using webcam')
+parser.add_argument('--feature_extractor', type=str, choices=['dog', 'canny', 'highpass'], default='dog', help='Feature extractor (default: dog)')
+parser.add_argument('--dropout_prob', type=float, default=0.10, help='Phosphene dropout probability (default: 0.10)')
+parser.add_argument('--temporal_noise_std', type=float, default=0.25, help='Temporal scintillation noise std (default: 0.25, increased for realism)')
+parser.add_argument('--multiplicative_noise_std', type=float, default=0.15, help='Multiplicative noise std for intensity-dependent scintillation (default: 0.15)')
+parser.add_argument('--position_jitter_std', type=float, default=0.10, help='Per-frame position jitter std in grid units (default: 0.10)')
+parser.add_argument('--filling_in_dilation_factor', type=float, default=1.5, help='Dilation factor for filling-in when surrounded by dim phosphenes (default: 1.5)')
+parser.add_argument('--filling_in_bright_thresh', type=float, default=0.7, help='Intensity threshold for filling-in candidate (default: 0.7)')
+parser.add_argument('--filling_in_dim_thresh', type=float, default=0.3, help='Neighbor average threshold for triggering filling-in (default: 0.3)')
+parser.add_argument('--crosstalk_factor', type=float, default=0.10, help='Crosstalk to neighbors (default: 0.10)')
+parser.add_argument('--brightness_gamma', type=float, default=0.6, help='Perceptual brightness gamma (default: 0.6)')
+parser.add_argument('--save_gif', action='store_true', help='Save animation as GIF')
+parser.add_argument('--gif_path', type=str, default='blindsight_simulation.gif')
+parser.add_argument('--gif_fps', type=int, default=20)
+parser.add_argument('--gif_duration', type=float, default=10.0, help='GIF duration in seconds')
+parser.add_argument('--head_movement', action='store_true', default=True, help='Enable slow head movement')
+parser.add_argument('--head_amplitude', type=float, default=40.0, help='Head movement amplitude in pixels')
+parser.add_argument('--head_freq', type=float, default=0.2, help='Head movement frequency')
+parser.add_argument('--enable_sonification', action='store_true', default=False, help='Enable brightness sonification (requires headphones)')
+parser.add_argument('--show_vf_overlay', action='store_true', default=True, help='Show visual field eccentricity rings and meridians on original view')
+parser.add_argument('--radial_elongation', type=float, default=1.3, help='Radial elongation factor for phosphene ellipticity (1.0 = circular, >1 elongated radial) (default: 1.3)')
+parser.add_argument('--persistence_decay', type=float, default=0.8, help='Decay factor for phosphene persistence (default: 0.8)')
+parser.add_argument('--adaptation_rate', type=float, default=0.05, help='Rate of long-term adaptation (fade over seconds) (default: 0.05)')
+parser.add_argument('--motion_blur_strength', type=float, default=5, help='Kernel size for motion blur during movement (default: 5)')
+parser.add_argument('--center_surround_sigma_center', type=float, default=1.0, help='Sigma for center Gaussian in DoG (default: 1.0)')
+parser.add_argument('--center_surround_sigma_surround', type=float, default=3.0, help='Sigma for surround Gaussian in DoG (default: 3.0)')
+parser.add_argument('--center_surround_weight', type=float, default=0.5, help='Weight of surround suppression (default: 0.5)')
+parser.add_argument('--crowding_factor', type=float, default=1.5, help='Additional size scaling in periphery for crowding (default: 1.5)')
+parser.add_argument('--peripheral_dropout_scale', type=float, default=2.0, help='Scale dropout probability higher in periphery (default: 2.0)')
+parser.add_argument('--max_ecc', type=float, default=10.0, help='Maximum eccentricity in degrees (limited FOV) (default: 10.0)')
+parser.add_argument('--phosphene_shape_var', type=float, default=0.5, help='Variance in phosphene shapes (0.0 = uniform, 1.0 = high variability) (default: 0.5)')
+parser.add_argument('--color_enabled', action='store_true', default=False, help='Enable limited color phosphenes')
+parser.add_argument('--facilitation_factor', type=float, default=0.05, help='Facilitatory crosstalk factor (default: 0.05)')
+parser.add_argument('--fatigue_rate', type=float, default=0.01, help='Global fatigue accumulation rate (default: 0.01)')
+parser.add_argument('--microsaccade_freq', type=float, default=0.5, help='Frequency of microsaccades in Hz (default: 0.5)')
+parser.add_argument('--patient_profile', type=str, choices=['naive_public_demo', 'argus_veteran', 'argus_veteran_2015_2020', 'optimistic_next_gen_retinal', 'early_cortical_orion_like', 'training_progression', 'orion_optimist'], default='argus_veteran', help='Patient profile preset (default: argus_veteran)')
+parser.add_argument('--training_mode', action='store_true', default=False, help='Enable training simulation mode')
+parser.add_argument('--failure_prob', type=float, default=0.05, help='Probability of random electrode failure per frame (default: 0.05)')
+args = parser.parse_args()
+
+# Extract config
+GRID_SIZE = args.grid_size
+BASE_PHOSPHENE_SIGMA = args.base_phosphene_sigma
+SPACING = args.spacing
+MAX_CURRENT = args.max_current
+THRESHOLD_CURRENT = args.threshold_current
+SATURATION_CURRENT = args.saturation_current
+MAX_SIGMA_SCALE = args.max_sigma_scale
+ECC_BASE_SIZE = args.ecc_base_size
+ECC_LINEAR_FACTOR = args.ecc_linear_factor
+IMPLANT_TYPE = args.implant_type
+USE_WEBCAM = args.use_webcam
+IMAGE_PATH = args.image_path
+FEATURE_EXTRACTOR = args.feature_extractor
+DROPOUT_PROB = args.dropout_prob
+TEMPORAL_NOISE_STD = args.temporal_noise_std
+MULTIPLICATIVE_NOISE_STD = args.multiplicative_noise_std
+POSITION_JITTER_STD = args.position_jitter_std
+FILLING_IN_DILATION_FACTOR = args.filling_in_dilation_factor
+FILLING_IN_BRIGHT_THRESH = args.filling_in_bright_thresh
+FILLING_IN_DIM_THRESH = args.filling_in_dim_thresh
+CROSSTALK_FACTOR = args.crosstalk_factor
+BRIGHTNESS_GAMMA = args.brightness_gamma
+SAVE_GIF = args.save_gif
+GIF_PATH = args.gif_path
+GIF_FPS = args.gif_fps
+GIF_DURATION_SEC = args.gif_duration
+ENABLE_HEAD_MOVEMENT = args.head_movement
+HEAD_MOVEMENT_AMPLITUDE = args.head_amplitude
+HEAD_MOVEMENT_FREQ = args.head_freq
+ENABLE_SONIFICATION = args.enable_sonification
+SHOW_VF_OVERLAY = args.show_vf_overlay
+RADIAL_ELONGATION = args.radial_elongation
+PERSISTENCE_DECAY = args.persistence_decay
+ADAPTATION_RATE = args.adaptation_rate
+MOTION_BLUR_STRENGTH = args.motion_blur_strength
+CS_SIGMA_CENTER = args.center_surround_sigma_center
+CS_SIGMA_SURROUND = args.center_surround_sigma_surround
+CS_WEIGHT = args.center_surround_weight
+CROWDING_FACTOR = args.crowding_factor
+PERIPHERAL_DROPOUT_SCALE = args.peripheral_dropout_scale
+MAX_ECC = args.max_ecc
+PHOSPHENE_SHAPE_VAR = args.phosphene_shape_var
+COLOR_ENABLED = args.color_enabled
+FACILITATION_FACTOR = args.facilitation_factor
+FATIGUE_RATE = args.fatigue_rate
+MICROSACCADE_FREQ = args.microsaccade_freq
+PATIENT_PROFILE = args.patient_profile
+TRAINING_MODE = args.training_mode
+FAILURE_PROB = args.failure_prob
+
+# Apply patient profile presets
+if PATIENT_PROFILE == 'naive_public_demo':
+    DROPOUT_PROB = 0.4
+    RADIAL_ELONGATION = 2.0
+    ADAPTATION_RATE = 0.1
+    BRIGHTNESS_GAMMA = 0.4
+    COLOR_ENABLED = False
+elif PATIENT_PROFILE == 'argus_veteran':
+    DROPOUT_PROB *= 1.5
+    ADAPTATION_RATE *= 1.2
+    FATIGUE_RATE *= 1.5
+    FAILURE_PROB *= 2.0
+elif PATIENT_PROFILE == 'argus_veteran_2015_2020':
+    DROPOUT_PROB = 0.275
+    RADIAL_ELONGATION = 1.6
+    ADAPTATION_RATE *= 1.5
+    TEMPORAL_NOISE_STD *= 1.2
+    MOTION_BLUR_STRENGTH = 7
+elif PATIENT_PROFILE == 'optimistic_next_gen_retinal':
+    DROPOUT_PROB = 0.05
+    RADIAL_ELONGATION = 1.1
+    ADAPTATION_RATE = 0.02
+    FATIGUE_RATE *= 0.5
+    TEMPORAL_NOISE_STD *= 0.7
+elif PATIENT_PROFILE == 'early_cortical_orion_like':
+    MAX_ECC = 20.0
+    TEMPORAL_NOISE_STD *= 1.5
+    RADIAL_ELONGATION = 1.5
+    DROPOUT_PROB *= 1.2
+elif PATIENT_PROFILE == 'training_progression':
+    TRAINING_MODE = True
+    DROPOUT_PROB *= 2.0
+    TEMPORAL_NOISE_STD *= 1.5
+    FATIGUE_RATE *= 1.5
+elif PATIENT_PROFILE == 'orion_optimist':
+    RADIAL_ELONGATION = 1.1
+    TEMPORAL_NOISE_STD *= 0.8
+    MAX_ECC = 15.0
+
+# Training mode adjustments
+if TRAINING_MODE:
+    training_progress = 0.0  # Will update in loop
+
+# =================================================================
+
+def create_retinotopic_grid(size, max_ecc=MAX_ECC, ecc0=0.3, a=5.0):
+    if PATIENT_PROFILE == 'early_cortical_orion_like':
+        a = 7.0
+    if IMPLANT_TYPE == 'retinal':
+        x, y = np.meshgrid(np.linspace(-1, 1, size), np.linspace(-1, 1, size))
+        return x, y
+    
+    y, x = torch.meshgrid(torch.linspace(-1, 1, size), torch.linspace(-1, 1, size), indexing='ij')
+    ecc = torch.sqrt(x**2 + y**2) * max_ecc
+    ang = torch.atan2(y, x)
+    
+    ang_sigma_base = 0.07
+    ecc_sigma_base = 0.2
+    ang_noise = torch.normal(0, ang_sigma_base * (1 + 0.1 * ecc / max_ecc))
+    ecc_noise = torch.normal(0, ecc_sigma_base * (1 + 0.1 * ecc / max_ecc))
+    
+    ang += ang_noise
+    ecc += ecc_noise
+    ecc = torch.clamp(ecc, 0.0, max_ecc)
+    
+    ecc_cort = a * torch.log(ecc / ecc0 + 1)
+    u = ecc_cort * torch.cos(ang)
+    v = ecc_cort * torch.sin(ang)
+    
+    u_min, u_max = u.min(), u.max()
+    v_min, v_max = v.min(), v.max()
+    u = 2 * (u - u_min) / (u_max - u_min + 1e-8) - 1
+    v = 2 * (v - v_min) / (v_max - v_min + 1e-8) - 1
+    
+    return u.numpy(), v.numpy()
+
+warp_x, warp_y = create_retinotopic_grid(GRID_SIZE)
+
+np.random.seed(42)
+PHOSPHENE_SIGMA_X_SCALE = np.random.uniform(0.8, 1.2, (GRID_SIZE, GRID_SIZE))
+PHOSPHENE_SIGMA_Y_SCALE = np.random.uniform(0.8, 1.2, (GRID_SIZE, GRID_SIZE))
+PHOSPHENE_SHAPES = np.random.choice([0, 1, 2], size=(GRID_SIZE, GRID_SIZE), p=[0.5, 0.3, 0.2])
+
+eccentricity_grid = np.sqrt((warp_x**2 + warp_y**2)) * MAX_ECC
+angle_grid = np.arctan2(warp_y, warp_x)
+angle_grid_deg = np.rad2deg(angle_grid)
+
+peripheral_dropout_grid = DROPOUT_PROB * (1 + (PERIPHERAL_DROPOUT_SCALE - 1) * (eccentricity_grid / MAX_ECC))
+
+# Setup figure
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+ax1.set_title("Original View" + (" (Cortical Implant)" if IMPLANT_TYPE == 'cortical' else " (Retinal Implant)"))
+ax2.set_title("Simulated Prosthesis Phosphene Vision\n(Enhanced: radial ellipticity, current spread, sonification option)")
+orig_img = ax1.imshow(np.zeros((480, 640, 3)), animated=True)
+phosphene_img = ax2.imshow(np.zeros((480, 480, 3) if COLOR_ENABLED else (480, 480)), cmap='gray' if not COLOR_ENABLED else None, vmin=0, vmax=1, animated=True)
+
+info_text = ax1.text(0.02, 0.98, "", transform=ax1.transAxes, color='white',
+                     fontsize=10, va='top', ha='left',
+                     bbox=dict(facecolor='black', alpha=0.7))
+
+if SHOW_VF_OVERLAY and IMPLANT_TYPE == 'cortical':
+    overlay = ax1.imshow(np.zeros((480, 640, 4)), animated=True, alpha=0.3)
+else:
+    overlay = None
+
+if USE_WEBCAM:
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open webcam!")
+else:
+    static_frame = cv2.imread(IMAGE_PATH)
+    if static_frame is None:
+        raise ValueError(f"Could not load image: {IMAGE_PATH}")
+    static_frame = cv2.cvtColor(static_frame, cv2.COLOR_BGR2RGB)
+
+if ENABLE_SONIFICATION:
+    pygame.mixer.init(frequency=22050, size=-16, channels=1, buffer=512)
+    sound_base_freq = 200
+    sound_max_freq = 800
+
+global_shift_x, global_shift_y = 0, 0
+start_time = time.time()
+
+prev_intensities = np.zeros((GRID_SIZE, GRID_SIZE))
+adaptation_levels = np.zeros((GRID_SIZE, GRID_SIZE))
+prev_output = None
+global_fatigue = 0.0
+last_microsaccade_time = start_time
+failure_mask = np.ones((GRID_SIZE, GRID_SIZE))
+
+prev_gray = None
+
+def create_vf_overlay_image(height=480, width=640):
+    img = np.zeros((height, width, 4))
+    center_x, center_y = width // 2, height // 2
+    ecc_degrees = [2, 5, 10, 20]
+    for ecc in ecc_degrees:
+        radius_pix = (ecc / 20) * min(center_x, center_y) * 0.8
+        cv2.circle(img, (center_x, center_y), int(radius_pix), (1,1,1,0.5), 2)
+        cv2.putText(img, f"{ecc}°", (center_x + int(radius_pix) + 5, center_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (1,1,1,0.7), 1)
+    for ang in [0, 45, 90, 135, 180, 225, 270, 315]:
+        rad = np.deg2rad(ang)
+        end_x = center_x + int(300 * np.cos(rad))
+        end_y = center_y + int(300 * np.sin(rad))
+        cv2.line(img, (center_x, center_y), (end_x, end_y), (1,1,0,0.4), 1)
+    return img
+
+vf_overlay_img = create_vf_overlay_image() if SHOW_VF_OVERLAY and IMPLANT_TYPE == 'cortical' else None
+
+def apply_center_surround(intensities):
+    center = cv2.GaussianBlur(intensities, (0,0), CS_SIGMA_CENTER)
+    surround = cv2.GaussianBlur(intensities, (0,0), CS_SIGMA_SURROUND)
+    dog = center - CS_WEIGHT * surround
+    return np.clip(dog, 0, 1)
+
+def apply_motion_blur(output, movement_speed, direction):
+    if movement_speed > 0 and prev_output is not None:
+        kernel_size = int(MOTION_BLUR_STRENGTH * movement_speed) | 1
+        kernel = np.zeros((kernel_size, kernel_size))
+        if direction == 'horizontal':
+            kernel[kernel_size//2, :] = 1.0 / kernel_size
+        else:
+            kernel[:, kernel_size//2] = 1.0 / kernel_size
+        output = cv2.filter2D(output, -1, kernel)
+    return output
+
+def get_phosphene_color(intensity):
+    if intensity < 0.3:
+        return (intensity, intensity, intensity)
+    elif intensity < 0.7:
+        return (0, 0, intensity)
+    else:
+        return (intensity, intensity, 0)
+
+def preprocess_frame(frame_bgr):
+    frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, (GRID_SIZE * 10, GRID_SIZE * 10), interpolation=cv2.INTER_LINEAR)
+    return frame, gray
+
+def extract_features(gray):
+    if FEATURE_EXTRACTOR == "canny":
+        features = cv2.Canny(gray, 50, 150)
+        features = cv2.GaussianBlur(features, (5,5), 1)
+    elif FEATURE_EXTRACTOR == "dog":
+        blur1 = cv2.GaussianBlur(gray, (5,5), 1.0)
+        blur2 = cv2.GaussianBlur(gray, (15,15), 5.0)
+        features = blur1 - blur2
+        features = np.clip(features, 0, None)
+        features = features / (features.max() + 1e-8)
+        features = (features * 255).astype(np.uint8)
+    elif FEATURE_EXTRACTOR == "highpass":
+        features = cv2.Laplacian(gray, cv2.CV_64F)
+        features = np.abs(features)
+        features = (features / (features.max() + 1e-8) * 255).astype(np.uint8)
+    return features
+
+def downsample_and_warp(features, intensities):
+    downsampled = cv2.resize(features, (GRID_SIZE, GRID_SIZE), interpolation=cv2.INTER_LINEAR)
+    intensities = downsampled / 255.0
+    warped = np.zeros_like(intensities)
+    if IMPLANT_TYPE == 'cortical':
+        for i in range(GRID_SIZE):
+            for j in range(GRID_SIZE):
+                src_x = int((warp_x[i, j] + 1) * GRID_SIZE / 2)
+                src_y = int((warp_y[i, j] + 1) * GRID_SIZE / 2)
+                src_x = np.clip(src_x, 0, GRID_SIZE - 1)
+                src_y = np.clip(src_y, 0, GRID_SIZE - 1)
+                warped[i, j] = intensities[src_y, src_x]
+    else:
+        warped = intensities.copy()
+    return warped
+
+def apply_temporal_effects(warped):
+    global prev_intensities, adaptation_levels, global_fatigue
+    new_intensities = warped
+    adaptation_levels += ADAPTATION_RATE * (new_intensities - adaptation_levels)
+    adapted_intensities = new_intensities * (1 - adaptation_levels) * (1 - global_fatigue)
+    persisted_intensities = PERSISTENCE_DECAY * prev_intensities + (1 - PERSISTENCE_DECAY) * adapted_intensities
+    prev_intensities = persisted_intensities
+    mult_noise = np.random.normal(1, MULTIPLICATIVE_NOISE_STD, persisted_intensities.shape)
+    add_noise = np.random.normal(0, TEMPORAL_NOISE_STD, persisted_intensities.shape)
+    intensities_noisy = np.clip(persisted_intensities * mult_noise + add_noise, 0, 1)
+    dropout_mask = np.random.random(intensities_noisy.shape) > peripheral_dropout_grid
+    intensities_noisy *= dropout_mask * failure_mask
+    return intensities_noisy
+
+def sonify_intensities(intensities_perc, eccentricity_grid, depth_map):
+    if ENABLE_SONIFICATION and intensities_perc.mean() > 0.01:
+        for i in range(GRID_SIZE):
+            for j in range(GRID_SIZE):
+                brightness = intensities_perc[i, j]
+                if brightness > 0.01:
+                    ecc = eccentricity_grid[i, j]
+                    depth_factor = depth_map[i, j]
+                    freq = sound_base_freq + brightness * (sound_max_freq - sound_base_freq) + ecc * 10 + (1 - depth_factor) * 100
+                    sample_rate = 22050
+                    duration = 0.05
+                    frames = int(duration * sample_rate)
+                    arr = np.sin(2 * np.pi * freq * np.linspace(0, duration, frames))
+                    arr = (arr * 32767).astype(np.int16)
+                    sound = pygame.sndarray.make_sound(arr)
+                    sound.play()
+
+def render_phosphenes(intensities_perc, currents, output_shape, pad=20, depth_map=None):
+    output_h, output_w = output_shape
+    full_h = output_h + 2 * pad
+    full_w = output_w + 2 * pad
+    channels = 3 if COLOR_ENABLED else 1
+    output = np.zeros((full_h, full_w, channels))
+    
+    y_centers = np.arange(GRID_SIZE) * SPACING + SPACING // 2 + pad
+    x_centers = np.arange(GRID_SIZE) * SPACING + SPACING // 2 + pad
+    
+    neighbors = [(-1,0), (1,0), (0,-1), (0,1)]
+    
+    neighbor_kernel = np.array([[0,1,0],[1,0,1],[0,1,0]]) / 4.0
+    avg_neighbors = ndimage.convolve(intensities_perc, neighbor_kernel, mode='constant', cval=0.0)
+    
+    for i in range(GRID_SIZE):
+        for j in range(GRID_SIZE):
+            intensity = intensities_perc[i, j]
+            current = currents[i, j]
+            if current < THRESHOLD_CURRENT:
+                continue
+            
+            activation_scale = (current / SATURATION_CURRENT) ** 0.5
+            activation_scale = np.clip(activation_scale, 0.1, 1.5)
+            
+            ecc = eccentricity_grid[i, j]
+            size_deg = ECC_BASE_SIZE + ECC_LINEAR_FACTOR * ecc
+            crowding_scale = 1 + (CROWDING_FACTOR - 1) * (ecc / MAX_ECC)
+            
+            sigma_scale = 1 + (MAX_SIGMA_SCALE - 1) * (activation_scale + (size_deg / 10.0)) * crowding_scale
+            
+            if intensity > FILLING_IN_BRIGHT_THRESH and avg_neighbors[i, j] < FILLING_IN_DIM_THRESH:
+                sigma_scale *= FILLING_IN_DILATION_FACTOR
+                intensity *= 1.1
+            
+            if depth_map is not None:
+                depth_factor = depth_map[i, j]
+                intensity *= (1 + 0.5 * (1 - depth_factor))
+                sigma_scale *= (1 + CROWDING_FACTOR * depth_factor)
+            
+            sigma_x_base = BASE_PHOSPHENE_SIGMA * sigma_scale * PHOSPHENE_SIGMA_X_SCALE[i, j]
+            sigma_y_base = BASE_PHOSPHENE_SIGMA * sigma_scale * PHOSPHENE_SIGMA_Y_SCALE[i, j]
+            
+            if IMPLANT_TYPE == 'cortical' and RADIAL_ELONGATION > 1.0:
+                radial_angle = angle_grid_deg[i, j]
+                sigma_radial = max(sigma_x_base, sigma_y_base) * RADIAL_ELONGATION
+                sigma_tangential = min(sigma_x_base, sigma_y_base)
+                sigma_x = sigma_radial
+                sigma_y = sigma_tangential
+                angle = radial_angle
+            else:
+                sigma_x = sigma_x_base
+                sigma_y = sigma_y_base
+                angle = 0
+            
+            shape_type = PHOSPHENE_SHAPES[i, j]
+            if shape_type == 1:
+                sigma_x *= 2.0 + np.random.uniform(-PHOSPHENE_SHAPE_VAR, PHOSPHENE_SHAPE_VAR)
+            elif shape_type == 2:
+                sigma_y *= 1.5 + np.random.uniform(-PHOSPHENE_SHAPE_VAR, PHOSPHENE_SHAPE_VAR)
+                angle += 90
+            
+            max_dim = max(1, int(6 * max(sigma_x, sigma_y)))
+            k_size = (max_dim // 2 * 2) + 1
+            ax = np.arange(-(k_size // 2), (k_size // 2) + 1)
+            xx, yy = np.meshgrid(ax, ax)
+            
+            if angle != 0:
+                theta = np.deg2rad(angle)
+                cos_t, sin_t = np.cos(theta), np.sin(theta)
+                x_rot = xx * cos_t + yy * sin_t
+                y_rot = -xx * sin_t + yy * cos_t
+                exp_arg = -(x_rot**2 / (2 * sigma_x**2) + y_rot**2 / (2 * sigma_y**2))
+            else:
+                exp_arg = -(xx**2 / (2 * sigma_x**2) + yy**2 / (2 * sigma_y**2))
+            
+            kernel = np.exp(exp_arg)
+            kernel /= (kernel.max() + 1e-8)
+            
+            if COLOR_ENABLED:
+                color = get_phosphene_color(intensity)
+                kernel = np.stack([kernel * c for c in color], axis=-1)
+            else:
+                kernel = kernel[..., np.newaxis] * intensity
+            
+            jitter_x = np.random.normal(0, POSITION_JITTER_STD * SPACING)
+            jitter_y = np.random.normal(0, POSITION_JITTER_STD * SPACING)
+            y_center = int(y_centers[i] + jitter_y)
+            x_center = int(x_centers[j] + jitter_x)
+            y_start = y_center - k_size // 2
+            x_start = x_center - k_size // 2
+
+            # Safe clamped blitting for main kernel
+            y_start_clamp = max(0, y_start)
+            y_end_clamp   = min(full_h, y_start + k_size)
+            x_start_clamp = max(0, x_start)
+            x_end_clamp   = min(full_w, x_start + k_size)
+
+            ky_start = y_start_clamp - y_start
+            ky_end   = ky_start + (y_end_clamp - y_start_clamp)
+            kx_start = x_start_clamp - x_start
+            kx_end   = kx_start + (x_end_clamp - x_start_clamp)
+
+            if y_end_clamp > y_start_clamp and x_end_clamp > x_start_clamp:
+                output[y_start_clamp:y_end_clamp, x_start_clamp:x_end_clamp] += \
+                    kernel[ky_start:ky_end, kx_start:kx_end]
+            
+            # Crosstalk
+            ct_supp = -intensity * CROSSTALK_FACTOR
+            ct_facil = intensity * FACILITATION_FACTOR
+            for di, dj in neighbors:
+                ni, nj = i + di, j + dj
+                if 0 <= ni < GRID_SIZE and 0 <= nj < GRID_SIZE:
+                    ny_center = int(y_centers[ni] + np.random.normal(0, POSITION_JITTER_STD * SPACING))
+                    nx_center = int(x_centers[nj] + np.random.normal(0, POSITION_JITTER_STD * SPACING))
+                    ny_start = ny_center - k_size // 2
+                    nx_start = nx_center - k_size // 2
+                    ct_kernel = kernel * ct_supp if random.random() < 0.7 else kernel * ct_facil
+
+                    ny_start_clamp = max(0, ny_start)
+                    ny_end_clamp   = min(full_h, ny_start + k_size)
+                    nx_start_clamp = max(0, nx_start)
+                    nx_end_clamp   = min(full_w, nx_start + k_size)
+
+                    cky_start = ny_start_clamp - ny_start
+                    cky_end   = cky_start + (ny_end_clamp - ny_start_clamp)
+                    ckx_start = nx_start_clamp - nx_start
+                    ckx_end   = ckx_start + (nx_end_clamp - nx_start_clamp)
+
+                    if ny_end_clamp > ny_start_clamp and nx_end_clamp > nx_start_clamp:
+                        output[ny_start_clamp:ny_end_clamp, nx_start_clamp:nx_end_clamp] += \
+                            ct_kernel[cky_start:cky_end, ckx_start:ckx_end]
+    
+    output = 1 / (1 + np.exp(-10 * (output - 0.5)))
+    output = np.clip(output, 0, 1)
+    return output
+
+def process_frame(frame_bgr, t):
+    global global_shift_x, global_shift_y, prev_intensities, adaptation_levels, prev_output, global_fatigue, last_microsaccade_time, failure_mask, training_progress, prev_gray
+    
+    if ENABLE_HEAD_MOVEMENT:
+        head_x = HEAD_MOVEMENT_AMPLITUDE * math.sin(2 * math.pi * HEAD_MOVEMENT_FREQ * t)
+        head_y = HEAD_MOVEMENT_AMPLITUDE * math.cos(2 * math.pi * HEAD_MOVEMENT_FREQ * t * 0.7)
+    else:
+        head_x = head_y = 0
+    
+    if t - last_microsaccade_time > 1 / MICROSACCADE_FREQ:
+        micro_x = random.uniform(-10, 10)
+        micro_y = random.uniform(-10, 10)
+        head_x += micro_x
+        head_y += micro_y
+        last_microsaccade_time = t
+    
+    prev_shift_x, prev_shift_y = global_shift_x, global_shift_y
+    total_shift_x = global_shift_x + head_x
+    total_shift_y = global_shift_y + head_y
+    movement_speed = math.sqrt((total_shift_x - prev_shift_x)**2 + (total_shift_y - prev_shift_y)**2) / SPACING
+    direction = 'horizontal' if abs(total_shift_x - prev_shift_x) > abs(total_shift_y - prev_shift_y) else 'vertical'
+    
+    rows, cols = frame_bgr.shape[:2]
+    M = np.float32([[1, 0, total_shift_x], [0, 1, total_shift_y]])
+    frame_bgr = cv2.warpAffine(frame_bgr, M, (cols, rows), flags=cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_WRAP)
+    
+    orig, gray = preprocess_frame(frame_bgr)
+    
+    if prev_gray is not None:
+        flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        magnitude, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+        depth_est = np.where(magnitude > 0, 1 / (magnitude + 1e-8), 1.0)
+        depth_est = cv2.normalize(depth_est, None, 0, 1, cv2.NORM_MINMAX)
+        depth_est = cv2.GaussianBlur(depth_est, (5,5), 2)
+    else:
+        depth_est = np.ones_like(gray) * 0.5
+    prev_gray = gray.copy()
+    
+    depth_resized = cv2.resize(depth_est, (GRID_SIZE, GRID_SIZE), interpolation=cv2.INTER_LINEAR)
+    
+    features = extract_features(gray)
+    intensities = cv2.resize(features, (GRID_SIZE, GRID_SIZE), interpolation=cv2.INTER_LINEAR) / 255.0
+    currents = intensities * MAX_CURRENT
+    
+    warped = downsample_and_warp(features, intensities)
+    warped = apply_center_surround(warped)
+    
+    intensities_noisy = apply_temporal_effects(warped)
+    
+    intensities_perc = np.power(intensities_noisy, BRIGHTNESS_GAMMA)
+    
+    sonify_intensities(intensities_perc, eccentricity_grid, depth_resized)
+    
+    output_h = GRID_SIZE * SPACING
+    output_w = GRID_SIZE * SPACING
+    output = render_phosphenes(intensities_perc, currents, (output_h, output_w), depth_map=depth_resized)
+    
+    output = apply_motion_blur(output, movement_speed, direction)
+    prev_output = output.copy()
+    
+    global_fatigue = min(1.0, global_fatigue + FATIGUE_RATE * movement_speed)
+    if random.random() < 0.01:
+        global_fatigue *= 0.8
+    
+    if random.random() < FAILURE_PROB:
+        fail_i, fail_j = random.randint(0, GRID_SIZE-1), random.randint(0, GRID_SIZE-1)
+        failure_mask[fail_i, fail_j] = 0
+    
+    if TRAINING_MODE:
+        training_progress = min(1.0, training_progress + 0.001)
+        global_fatigue *= (1 - training_progress * 0.5)
+        TEMPORAL_NOISE_STD *= (1 - training_progress * 0.3)
+    
+    output = output[pad:pad+output_h, pad:pad+output_w]
+    
+    output_display = cv2.resize(output, (480, 480), interpolation=cv2.INTER_LINEAR)
+    orig_display = cv2.resize(orig, (640, 480))
+    
+    return orig_display, output_display
+
+def update(frame_no):
+    t = time.time() - start_time
+    
+    if USE_WEBCAM:
+        ret, frame_bgr = cap.read()
+        if not ret:
+            ani.event_source.stop()
+            return orig_img, phosphene_img
+        frame_bgr = cv2.flip(frame_bgr, 1)
+    else:
+        frame_bgr = cv2.cvtColor(static_frame, cv2.COLOR_RGB2BGR)
+    
+    orig, phosph = process_frame(frame_bgr, t)
+    
+    orig_img.set_array(orig)
+    phosphene_img.set_array(phosph)
+    
+    if overlay is not None:
+        overlay.set_array(vf_overlay_img)
+    
+    info = (f"Implant: {IMPLANT_TYPE.capitalize()} | Extractor: {FEATURE_EXTRACTOR} | Dropout: {DROPOUT_PROB:.2f}\n"
+            f"Noise: {TEMPORAL_NOISE_STD:.2f} | Gamma: {BRIGHTNESS_GAMMA:.1f} | Sonification: {ENABLE_SONIFICATION}\n"
+            f"Max µA: {MAX_CURRENT} | Thresh: {THRESHOLD_CURRENT}µA | Radial elong: {RADIAL_ELONGATION:.1f}x\n"
+            f"Profile: {PATIENT_PROFILE} | Fatigue: {global_fatigue:.2f} | Training: {TRAINING_MODE}\n"
+            f"Press 's' saccade | 'q'/'w' extractor | 'r' reset shift")
+    info_text.set_text(info)
+    
+    items = [orig_img, phosphene_img, info_text]
+    if overlay is not None:
+        items.append(overlay)
+    return items
+
+def on_key(event):
+    global global_shift_x, global_shift_y, FEATURE_EXTRACTOR
+    if event.key == 's':
+        shift_mag = 80
+        global_shift_x = random.randint(-shift_mag, shift_mag)
+        global_shift_y = random.randint(-shift_mag, shift_mag)
+        print(f"Simulated saccade: shift ({global_shift_x:+.0f}, {global_shift_y:+.0f})")
+    elif event.key == 'r':
+        global_shift_x = global_shift_y = 0
+        print("Shift reset")
+    elif event.key in ['q', 'w']:
+        extractors = ["dog", "canny", "highpass"]
+        idx = extractors.index(FEATURE_EXTRACTOR)
+        if event.key == 'q':
+            idx = (idx - 1) % len(extractors)
+        else:
+            idx = (idx + 1) % len(extractors)
+        FEATURE_EXTRACTOR = extractors[idx]
+        print(f"Feature extractor: {FEATURE_EXTRACTOR}")
+
+interval_ms = 50 if USE_WEBCAM else 100
+frame_limit = None if USE_WEBCAM or not SAVE_GIF else int(GIF_DURATION_SEC * 1000 / interval_ms)
+
+ani = FuncAnimation(fig, update, interval=interval_ms, blit=False,
+                    repeat=USE_WEBCAM or not SAVE_GIF, frames=frame_limit)
+
+fig.canvas.mpl_connect('key_press_event', on_key)
+
+if not USE_WEBCAM:
+    ax1.text(0.02, 0.02, "Static image mode", transform=ax1.transAxes,
+             color='white', fontsize=12, va='bottom', ha='left',
+             bbox=dict(facecolor='black', alpha=0.6))
+
+if SAVE_GIF:
+    print(f"Saving GIF to {GIF_PATH}...")
+    writer = PillowWriter(fps=GIF_FPS)
+    ani.save(GIF_PATH, writer=writer)
+    print("GIF saved!")
+else:
+    plt.show()
+
+if USE_WEBCAM:
+    cap.release()
+if ENABLE_SONIFICATION:
+    pygame.mixer.quit()
